@@ -11,7 +11,7 @@ DATA_ROOT = os.path.join(root_path, r"datasets\NTURGBD")
 RAW_SKELETON_DIR = os.path.join(DATA_ROOT, "skeletons")
 RGB_DIR= os.path.join(DATA_ROOT, "rgb")
 OUTPUT_DIR = r"NTURGBD"
-BAD_SAMPLES_FILE = r"NTURGBD/NTU_RGBD120_samples_with_missing_skeletons.txt"
+BAD_SAMPLES_FILE = r"NTURGBD\NTU_RGBD120_samples_with_missing_skeletons.txt"
 CHECK_MODALITIES = ['rgb', 'depth', 'ir']
 
 
@@ -112,3 +112,4 @@ def process():
 
 if __name__ == "__main__":
     process()
+
