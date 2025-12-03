@@ -4,7 +4,9 @@ import cv2
 import os
 import glob
 import pickle
+import re
 from torch.utils.data import Dataset
+from pathlib import Path
 
 try:
     from decord import VideoReader, cpu
@@ -12,6 +14,8 @@ try:
 except ImportError:
     HAS_DECORD = False
     print("[警告] 未检测到 decord 库，将使用 OpenCV 读取视频，速度可能较慢。建议 pip install decord")
+
+root_path = Path(__file__).parent.parent
 
 # Cross Subject (X-Sub)
 NTU60_TRAIN_CS = [1, 2, 4, 5, 8, 9, 13, 14, 15, 16, 17, 18, 19, 25, 27, 28, 31, 34, 35, 38]
@@ -69,6 +73,46 @@ class BaseMultiModalDataset(Dataset):
             else: frames.append(np.zeros((*self.image_size, 3), dtype=np.uint8))
         cap.release()
         tensor = torch.tensor(np.array(frames), dtype=torch.float32).permute(3, 0, 1, 2)
+        return tensor / 255.0
+
+    def _process_image_folder(self, folder_path, suffix, is_color=True):
+        if not os.path.exists(folder_path):
+            channels = 3 if is_color else 1
+            return torch.zeros(channels, self.num_frames, *self.image_size)
+
+        files = glob.glob(os.path.join(folder_path, f'*{suffix}'))
+        pattern = re.compile(r'frame_(\d+)_', re.IGNORECASE)
+
+        def sort_key(fname):
+            match = pattern.search(os.path.basename(fname))
+            return int(match.group(1)) if match else 0
+
+        files.sort(key=sort_key)
+
+        indices = self._get_indices(len(files))
+        frames = []
+
+        for i in indices:
+            if i < len(files):
+                if is_color:
+                    img = cv2.imread(files[i])  # BGR
+                    if img is not None:
+                        img = cv2.resize(img, self.image_size)
+                        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    else: img = np.zeros((*self.image_size, 3), dtype=np.uint8)
+                else:
+                    img = cv2.imread(files[i], cv2.IMREAD_GRAYSCALE)
+                    if img is not None: img = cv2.resize(img, self.image_size)
+                    else: img = np.zeros(self.image_size, dtype=np.uint8)
+                frames.append(img)
+            else:
+                # Padding
+                if is_color: frames.append(np.zeros((*self.image_size, 3), dtype=np.uint8))
+                else: frames.append(np.zeros(self.image_size, dtype=np.uint8))
+
+        tensor = torch.tensor(np.array(frames), dtype=torch.float32)
+        if is_color: tensor = tensor.permute(3, 0, 1, 2)            # (T, H, W, C) -> (C, T, H, W)
+        else: tensor = tensor.unsqueeze(0)                          # (T, H, W) -> (1, T, H, W)
         return tensor / 255.0
 
     def _process_depth_folder(self, folder_path):
@@ -181,35 +225,69 @@ class NTURGBDDataset(BaseMultiModalDataset):
 class NUCLADataset(BaseMultiModalDataset):
     def __init__(self,
                  meta_path,
+                 skeleton_path,
                  data_root,
                  split='train',
                  modalities=['rgb', 'pose', 'depth'],
                  num_frames=64):
-        safe_modalities = [m for m in modalities if m!= 'ir']
 
+        safe_modalities = [m for m in modalities if m != 'ir']
         super().__init__(data_root, safe_modalities, num_frames)
 
         print(f"Loading N-UCLA metadata from {meta_path} ...")
-        self.all_samples = np.load(meta_path, allow_pickle=True)
+        with open(meta_path, 'rb') as f:
+            self.all_meta = pickle.load(f)
+
+        print(f"Loading N-UCLA skeletons from {skeleton_path} ...")
+        self.skeleton_data = np.load(skeleton_path, allow_pickle=True)
+
         self.split = split
-        self.samples = self._filter_samples()
+        self._filter_samples()
         print(f"N-UCLA | {split} | {len(self.samples)} samples")
 
     def _filter_samples(self):
-        filtered = []
-        for item in self.all_samples:
-            view_id = item.get('cam')
-            if view_id is None:
-                if 'view_1' in item['name']: view_id = 1
-                elif 'view_2' in item['name']: view_id = 2
-                else: view_id = 3
-            is_train = (view_id != 3)
+        """
+        Train: View 1, View 2
+        Test:  View 3
+        """
+        for idx, meta in enumerate(self.all_meta):
+            view_id = meta.get('view_id', 0)
+
+            is_train = (view_id == 1 or view_id == 2)
 
             target_is_train = (self.split in ['train', 'val'])
 
             if (target_is_train and is_train) or (self.split == 'test' and not is_train):
-                filtered.append(item)
-        return filtered
+                if meta.get('quality') != 'missing':
+                    self.samples.append((idx, meta))
+
+    def __getitem__(self, idx):
+        original_idx = self.samples[idx][0]
+        meta = self.samples[idx][1]
+
+        sample_name = meta['sample_name']
+        file_name = meta['file_name']
+        view_id = meta['view_id']
+
+        result = {
+            'label': int(meta['label']),
+            'sample_name': sample_name,
+            'missing_skeleton': meta.get('missing_skeleton', False)
+        }
+
+        if 'pose' in self.modalities:
+            raw_pose_object = self.skeleton_data[original_idx]
+            result['pose'] = self._process_skeleton(raw_pose_object)
+
+        clip_path = os.path.join(self.data_root, f"view_{view_id}", file_name)
+
+        if 'rgb' in self.modalities:
+            result['rgb'] = self._process_image_folder(clip_path, '_rgb.jpg', is_color=True)
+
+        if 'depth' in self.modalities:
+            result['depth'] = self._process_image_folder(clip_path, '_depth.png', is_color=False)
+
+        return result
 
 
 def get_dataset(dataset_name, split, args):
@@ -219,11 +297,10 @@ def get_dataset(dataset_name, split, args):
          split: 'train', 'val', 'test'
          args: Dict, including 'modalities', 'benchmark', 'use_val', 'num_frames'...
     """
-    NTU_ROOT = r"C:\Users\YZ\PycharmProjects\MyGMD_KB\datasets\NTURGBD"
+    NTU_ROOT = os.path.join(root_path, r"datasets\NTURGBD")
     NTU_META = os.path.join(NTU_ROOT, 'meta.pkl')
-
-    NUCLA_ROOT = r"C:\Users\YZ\PycharmProjects\MyGMD_KB\datasets\NUCLA"
-    NUCLA_META = None
+    NUCLA_ROOT = os.path.join(root_path, r"datasets\NUCLA")
+    NUCLA_META = os.path.join(NUCLA_ROOT, 'meta.pkl')
 
     modalities = args.get('modalities', ['rgb', 'pose', 'ir', 'depth'])
     num_frames = args.get('num_frames', 64)
@@ -242,9 +319,11 @@ def get_dataset(dataset_name, split, args):
             modalities=modalities,
             num_frames=num_frames
         )
+
     elif 'NUCLA' in dataset_name:
         dataset = NUCLADataset(
             meta_path=NUCLA_META,
+            skeleton_path=os.path.join(NUCLA_ROOT, 'skeletons.npy'),
             data_root=NUCLA_ROOT,
             split=split,
             modalities=modalities,
