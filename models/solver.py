@@ -57,7 +57,6 @@ class Solver:
             l_shared_scaled = l_shared / self.accum_steps
             l_specs_scaled = {k: v / self.accum_steps for k, v in l_specs.items()}
 
-            self.optimizer.zero_grad()
             total_spec_loss = sum(l_specs_scaled.values()) * self.lambda_spec
             total_spec_loss.backward(retain_graph=True)
 
@@ -157,3 +156,4 @@ class Solver:
             # 注意：这会将 g_shared_modified 累加到 z.grad 上
             # 最终 z.grad = \nabla_{spec} + \nabla_{shared}'
             z.backward(g_shared_modified, retain_graph=True)
+
